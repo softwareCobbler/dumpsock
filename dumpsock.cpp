@@ -1,197 +1,148 @@
 // listens on port 9999 for incoming data, tries to read it all, and dumps it to stdout
 
-#include <winsock2.h>
-#include <WS2tcpip.h>
+#include <chrono>
 #include <cstdio>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
 
+#include <winsock2.h>
+#include <WS2tcpip.h>
+
+#undef min
+#undef max
+
 #pragma comment(lib, "Ws2_32.lib")
 
-// create an ipv4 address in the win32 format that all the socket functions expect
-sockaddr_in sockAddrForPort(uint16_t port) {
-    return {
-        .sin_family = AF_INET,
-        .sin_port = htons(port),
-        .sin_addr = {
-            .S_un = {
-                .S_un_b = {
-                    .s_b1 = 0,
-                    .s_b2 = 0,
-                    .s_b3 = 0,
-                   .s_b4 = 0
-               }
-            }
-        }
-    };
-}
+class SocketDumper {
+private:
+    WSADATA wsaData_;
+    SOCKET socket_;
+    sockaddr_in addr_;
+    SOCKET incomingDataSocket_;
+    std::vector<char> received_;
 
-// this is an experiment with a monad-ish (?? it's kind-of a reader monad?) error handling pattern
-// "but it's just exceptions but you had to do more work" yes it's an experiment
-// it's funny that this takes us back to the older C style where we have to declare all our variables up front,
-// except here we declare them as members of some "environment"
-// we have a "Context", which is `Env | Error`
-// if Context is Error, any calls to operate on the context are no-ops, kind of like an optional<T>
-// if anything, this gives a really clean exposition at the use-site of what the steps are to use a socket
-namespace Monadish {
-    struct Env {
-        WSADATA wsaData;
-        SOCKET socket;
-        sockaddr_in addr;
-        SOCKET incomingDataSocket;
-        std::vector<char> received;
-    };
+    std::optional<std::string> error_;
 
-    struct Error {
-        Error() = delete;
-        Error(const char* c) : msg(c) {}
-        Error(std::string s) : msg(std::move(s)) {}
-        std::string msg;
-    };
-
-    struct Nil {};
-
-    using Context = std::variant<Env, Error>;
-    using Result = std::variant<Nil, Error>; // Nil first, for the default constructability; note we don't want to accidentally construct Errors with `return {}`
-
-    Context freshContext() {
-        return Context(Env{});
-    }
-
-    template<typename ... Args>
-    auto withContext(Context& ctx, auto callable, Args&& ... args) {
-        return callable(ctx, std::forward<Args>(args)...);
-    }
-
-    void errorGuard(Context& ctx, auto callable) {
-        if (std::holds_alternative<Error>(ctx)) {
-            return;
-        }
-        auto result = callable(std::get<Env>(ctx));
-        if (std::holds_alternative<Error>(result)) {
-            ctx = std::get<Error>(result);
-        }
-    }
-
-    void errorGuard(Context& ctx, auto onOk, auto onFailure) {
-        if (std::holds_alternative<Error>(ctx)) {
-            onFailure(std::get<Error>(ctx));
-            return;
-        }
-        auto result = onOk(std::get<Env>(ctx));
-        if (std::holds_alternative<Error>(result)) {
-            ctx = std::get<Error>(result);
-        }
-    }
-
-    void init(Context& ctx) {
-        errorGuard(ctx, [](Env& env) -> Result {
-            int iResult = WSAStartup(MAKEWORD(2, 2), &env.wsaData);
-            if (iResult != 0) {
-                return Error{ "WSAStartup failed: " + std::to_string(iResult) };
-            }
-            return {};
-        });
-    }
-
-    void setupTcpSocket(Context& ctx) {
-        errorGuard(ctx, [](Env& env) -> Result {
-            env.socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (env.socket == INVALID_SOCKET) {
-                return Error{ "Couldn't create a tcp socket" };
-            }
-            return {};
-        });
-    }
-
-    void sockAddrForPort(Context& ctx, int port) {
-        errorGuard(ctx, [port](Env& env) -> Result {
-            env.addr = ::sockAddrForPort(port);
-            return {};
-        });
-    }
-
-    void bindSocket(Context& ctx) {
-        errorGuard(ctx, [](Env& env) -> Result {
-            int result = bind(env.socket, (sockaddr*)&env.addr, sizeof(sockaddr_in));
-            if (result == SOCKET_ERROR) {
-                return Error{ "socket bind error" };
-            }
-            return {};
-        });
-    }
-
-    void listenSocket(Context& ctx) {
-        errorGuard(ctx, [](Env& env) -> Result {
-            int result = listen(env.socket, /*backlog*/1);
-            if (result == SOCKET_ERROR) {
-                return Error{ "socket listen error" };
-            }
-            return {};
-        });
-    }
-
-    void acceptSocket(Context& ctx) {
-        errorGuard(ctx, [](Env& env) -> Result {
-            env.incomingDataSocket = accept(env.socket, NULL, NULL);
-            if (env.incomingDataSocket == INVALID_SOCKET) {
-                return Error{ "socket accept error" };
-            }
-            return {};
-        });
-    }
-
-    void drainSocket(Context& ctx) {
-        errorGuard(ctx, [](Env& env) -> Result {
-            constexpr int buffSize = 4096;
-
-            env.received.reserve(1024 * 1024 * 1); // 1MiB
-
-            char buf[buffSize] = { 0 };
-            int result = 0;
-
-            while (result = recv(env.incomingDataSocket, buf, buffSize, 0)) {
-                if (result == SOCKET_ERROR) {
-                    return Error{ "socket error during read" };
+    // create an ipv4 address in the win32 format that all the socket functions expect
+    sockaddr_in sockAddrForPort(uint16_t port) {
+        return {
+            .sin_family = AF_INET,
+            .sin_port = htons(port),
+            .sin_addr = {
+                .S_un = {
+                    .S_un_b = {
+                        .s_b1 = 0,
+                        .s_b2 = 0,
+                        .s_b3 = 0,
+                       .s_b4 = 0
+                   }
                 }
-                const int readSize = result;
-                env.received.insert(env.received.end(), buf, buf + readSize);
-                memset(buf, 0, buffSize);
             }
-
-            return {};
-        });
-    }
-
-    void dump(Context& ctx) {
-        auto ok = [](Env& env) -> Result {
-            std::fwrite(env.received.data(), sizeof(char), env.received.size(), stdout);
-            return {};
         };
-        auto fail = [](Error& err) {
-            std::cout << err.msg << std::endl;
-        };
-        errorGuard(ctx, ok, fail);
     }
 
-    int getExitCode(Context& ctx) {
-        return std::holds_alternative<Error>(ctx) ? EXIT_FAILURE : EXIT_SUCCESS;
+    void setError(std::string msg) {
+        error_ = std::move(msg);
     }
-}
 
-// imagine a world, where the type system could validate that these were called in order
+    boolean hasError() const {
+        return error_.has_value();
+    }
+public:
+    SocketDumper() {}
+
+    void initWsa() {
+        int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData_);
+        if (iResult != 0) {
+            setError("WSAStartup failed: " + std::to_string(iResult));
+        }
+    }
+
+    void initTcpSocket(uint16_t port) {
+        if (hasError()) return;
+
+        socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_ == INVALID_SOCKET) {
+            setError("Couldn't create a tcp socket");
+            return;
+        }
+        addr_ = sockAddrForPort(port);
+    }
+
+    void bindSocket() {
+        if (hasError()) return;
+
+        int result = bind(socket_, (sockaddr*)&addr_, sizeof(sockaddr_in));
+        if (result == SOCKET_ERROR) {
+            setError("socket bind error");
+            return;
+        }
+    }
+
+    void listenSocket() {
+        if (hasError()) return;
+
+        int result = listen(socket_, /*backlog*/1);
+        if (result == SOCKET_ERROR) {
+            setError("socket listen error");
+            return;
+        }
+    }
+
+    void acceptSocket() {
+        if (hasError()) return;
+
+        incomingDataSocket_ = accept(socket_, NULL, NULL);
+        if (incomingDataSocket_ == INVALID_SOCKET) {
+            setError("socket accept error");
+        }
+    }
+
+    void drainSocket() {
+        if (hasError()) return;
+
+        constexpr int buffSize = 4096;
+
+        received_.reserve(1024 * 1024 * 1); // 1MiB
+
+        char buf[buffSize];
+        int result = 0;
+
+        while (result = recv(incomingDataSocket_, buf, buffSize, 0)) {
+            if (result == SOCKET_ERROR) {
+                setError("socket error during read");
+                return;
+            }
+            const int readSize = result;
+            received_.insert(received_.end(), buf, buf + readSize);
+        }
+    }
+
+    void dump() {
+        if (hasError()) {
+            std::cout << *error_ << std::endl;
+        }
+        else {
+            std::fwrite(received_.data(), sizeof(char), received_.size(), stdout);
+        }
+    }
+
+    int getExitCode() {
+        return hasError() ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+};
+
 int main() {
-    namespace M = Monadish;
-    auto ctx = M::freshContext();
-    M::withContext(ctx, M::init);
-    M::withContext(ctx, M::setupTcpSocket);
-    M::withContext(ctx, M::sockAddrForPort, 9999);
-    M::withContext(ctx, M::bindSocket);
-    M::withContext(ctx, M::listenSocket);
-    M::withContext(ctx, M::acceptSocket);
-    M::withContext(ctx, M::drainSocket);
-    M::withContext(ctx, M::dump);
-    return M::withContext(ctx, M::getExitCode);
+    SocketDumper socketDumper{};
+    socketDumper.initWsa();
+    socketDumper.initTcpSocket(9999);
+    socketDumper.bindSocket();
+    socketDumper.listenSocket();
+    socketDumper.acceptSocket();
+    socketDumper.drainSocket();
+    socketDumper.dump();
+    return socketDumper.getExitCode();
 }
