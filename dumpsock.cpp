@@ -8,6 +8,9 @@
 #include <variant>
 #include <vector>
 
+// windows stuff
+#include <fcntl.h>
+#include <io.h>
 #include <winsock2.h>
 #include <WS2tcpip.h>
 
@@ -116,6 +119,7 @@ public:
                 setError("socket error during read");
                 return;
             }
+
             const int readSize = result;
             received_.insert(received_.end(), buf, buf + readSize);
         }
@@ -123,7 +127,7 @@ public:
 
     void dump() {
         if (hasError()) {
-            std::cout << *error_ << std::endl;
+            std::cerr << *error_ << std::endl;
         }
         else {
             std::fwrite(received_.data(), sizeof(char), received_.size(), stdout);
@@ -136,6 +140,8 @@ public:
 };
 
 int main() {
+    _setmode(_fileno(stdout), O_BINARY); // write to stdout in binary mode, not character mode; otherwise windows adds an 0x0D byte for every 0x0A byte
+
     SocketDumper socketDumper{};
     socketDumper.initWsa();
     socketDumper.initTcpSocket(9999);
