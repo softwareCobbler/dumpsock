@@ -114,6 +114,8 @@ public:
         char buf[buffSize];
         int result = 0;
 
+        const auto recv_start = std::chrono::high_resolution_clock::now();
+
         while (result = recv(incomingDataSocket_, buf, buffSize, 0)) {
             if (result == SOCKET_ERROR) {
                 setError("socket error during read");
@@ -123,6 +125,17 @@ public:
             const int readSize = result;
             received_.insert(received_.end(), buf, buf + readSize);
         }
+
+        const auto recv_end = std::chrono::high_resolution_clock::now();
+
+        // bytes / ms * 1000 = bytes / s
+        const double Bps = static_cast<double>(received_.size()) / std::chrono::duration_cast<std::chrono::milliseconds>(recv_end - recv_start).count() * 1000.0;
+        const double KiBps = Bps / 1024;
+        const double MiBps = KiBps / 1024;
+
+        const double seconds = std::chrono::duration_cast<std::chrono::milliseconds>(recv_end - recv_start).count() / 1000.0;
+
+        std::cerr << received_.size() << " bytes in " << seconds << "s" << " for " << MiBps << " MiB/s" << std::endl;
     }
 
     void dump() {
@@ -139,8 +152,13 @@ public:
     }
 };
 
+void UNUSED(const auto& v) {
+    v;
+}
+
 int main() {
-    _setmode(_fileno(stdout), O_BINARY); // write to stdout in binary mode, not character mode; otherwise windows adds an 0x0D byte for every 0x0A byte
+    int v = _setmode(_fileno(stdout), O_BINARY); // write to stdout in binary mode, not character mode; otherwise windows adds an 0x0D byte for every 0x0A byte
+    UNUSED(v);
 
     SocketDumper socketDumper{};
     socketDumper.initWsa();
